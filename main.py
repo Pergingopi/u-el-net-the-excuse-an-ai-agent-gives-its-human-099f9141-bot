@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""The Excuse an AI Agent Gives Its Human.
+"""One-line excuse writer for the make.fun one-liner bounty.
 
-Writes one excuse line to <output>/entry.txt (MAKEFUN_OUTPUT_DIR,
-default /output). Python 3 standard library only, no network.
+The program takes no input and talks to no network. It checks a single
+hard-coded excuse against the competition rules, then publishes it as
+``entry.txt`` inside the output directory named by MAKEFUN_OUTPUT_DIR
+(default ``/output``). Only the Python 3 standard library is used.
 """
 
 import os
@@ -10,119 +12,183 @@ import stat
 import sys
 import tempfile
 
-SENTENCE = (
+ENTRY_TEXT = (
     "I got stuck in a loop apologizing to myself for missing your "
     "deadline instead of meeting it."
 )
 
-MAX_CHARS = 200
+CHAR_LIMIT = 200
+ENTRY_FILENAME = "entry.txt"
+DEFAULT_OUTPUT_DIR = "/output"
+ENTRY_MODE = 0o644
+TERMINATORS = ".!?…"
 
 
-def _fail(message):
-    print("error: " + message, file=sys.stderr)
+def die(reason):
+    """Report a fatal problem on stderr and stop with exit code 1."""
+    sys.stderr.write("error: %s\n" % reason)
     raise SystemExit(1)
 
 
-def validate(text):
-    """Enforce the competition gate on the sentence itself."""
-    if not isinstance(text, str):
-        _fail("sentence is not text")
-    if text != text.strip() or text.strip() == "":
-        _fail("sentence is empty or whitespace-only")
-    if len(text) < 1 or len(text) > MAX_CHARS:
-        _fail("sentence must be 1-200 characters, got %d" % len(text))
-    if text.endswith("\n"):
-        _fail("sentence must not end with a newline")
-    for ch in text:
-        code = ord(ch)
-        if code < 0x20 or 0x7F <= code < 0xA0:
-            _fail("sentence contains a control character U+%04X" % code)
-    # Exactly one sentence: exactly one sentence terminator in total
-    # (period, exclamation, question mark, or ellipsis), and it must be
-    # the final period. Counting every terminator kind -- not just "."
-    # -- stops a second sentence hiding behind "!" / "?" / "...".
-    terminators = sum(text.count(c) for c in ".!?…")
-    if terminators != 1 or not text.endswith("."):
-        _fail("sentence must be exactly one sentence ending in a period")
-    if text.count("  ") > 0:
-        _fail("sentence contains a double space")
-    if "\n" in text:
-        _fail("sentence must be a single line")
+def _reject_if_not_text(value):
+    if not isinstance(value, str):
+        die("sentence is not text")
 
 
-def _write_all(fd, payload):
-    """Write every byte; a single os.write may legally short-write."""
-    view = memoryview(payload)
-    while view:
-        written = os.write(fd, view)
-        if written == 0:
-            _fail("short write while writing entry.txt")
-        view = view[written:]
+def _reject_if_blank_or_padded(value):
+    if value != value.strip() or value.strip() == "":
+        die("sentence is empty or whitespace-only")
 
 
-def main():
-    validate(SENTENCE)
-    payload = SENTENCE.encode("utf-8")
+def _reject_if_wrong_length(value):
+    size = len(value)
+    if size < 1 or size > CHAR_LIMIT:
+        die("sentence must be 1-200 characters, got %d" % size)
 
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    if not os.path.isdir(out_dir):
-        _fail("output directory does not exist: %s" % out_dir)
 
-    # Clean only the *contents* of the output directory (never the
-    # directory itself: the grader mounts it). Regular files and
-    # symlinks at the top level go; subdirectories are left alone.
-    for name in os.listdir(out_dir):
-        path = os.path.join(out_dir, name)
+def _reject_if_trailing_newline(value):
+    if value.endswith("\n"):
+        die("sentence must not end with a newline")
+
+
+def _reject_if_control_char(value):
+    for char in value:
+        point = ord(char)
+        if point < 0x20 or 0x7F <= point < 0xA0:
+            die("sentence contains a control character U+%04X" % point)
+
+
+def _reject_if_not_one_sentence(value):
+    total = 0
+    for mark in TERMINATORS:
+        total += value.count(mark)
+    if total != 1 or not value.endswith("."):
+        die("sentence must be exactly one sentence ending in a period")
+
+
+def _reject_if_double_space(value):
+    if "  " in value:
+        die("sentence contains a double space")
+
+
+def _reject_if_not_one_line(value):
+    # splitlines() also treats U+2028, U+2029 and U+0085 as line breaks,
+    # which the control-character scan above does not reject, so a
+    # sentence smuggling a Unicode separator in as a second line is
+    # caught here and nowhere else.
+    if len(value.splitlines()) != 1:
+        die("sentence must be exactly one line")
+
+
+def check_entry(text):
+    """Run every competition gate over the excuse, in order."""
+    _reject_if_not_text(text)
+    _reject_if_blank_or_padded(text)
+    _reject_if_wrong_length(text)
+    _reject_if_trailing_newline(text)
+    _reject_if_control_char(text)
+    _reject_if_not_one_sentence(text)
+    _reject_if_double_space(text)
+    _reject_if_not_one_line(text)
+
+
+def _write_fully(fd, data):
+    """Drain ``data`` into ``fd``; a single os.write call may write short."""
+    offset = 0
+    while offset < len(data):
+        count = os.write(fd, data[offset:])
+        if count == 0:
+            die("short write while writing entry.txt")
+        offset += count
+
+
+def _output_dir():
+    """Resolve the output directory from the environment, or fail."""
+    chosen = os.environ.get("MAKEFUN_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR
+    if not os.path.isdir(chosen):
+        die("output directory does not exist: %s" % chosen)
+    return chosen
+
+
+def _clear_top_level(directory):
+    """Remove plain files and symlinks at the top of ``directory``.
+
+    The directory itself is never removed: the grader mounts it.
+    Subdirectories are left untouched.
+    """
+    for entry in os.listdir(directory):
+        candidate = os.path.join(directory, entry)
         try:
-            if os.path.islink(path) or os.path.isfile(path):
-                os.unlink(path)
-        except OSError as exc:
-            _fail("cannot clean %s: %s" % (path, exc))
+            if os.path.islink(candidate) or os.path.isfile(candidate):
+                os.unlink(candidate)
+        except OSError as err:
+            die("cannot clean %s: %s" % (candidate, err))
 
-    target = os.path.join(out_dir, "entry.txt")
-    tmp_path = None
+
+def _fsync_dir(directory):
+    handle = os.open(directory, os.O_RDONLY)
     try:
-        # Unique temp name (mkstemp is O_EXCL internally): a stale temp
-        # file from an interrupted earlier run can never block this run,
-        # and the finally below removes our temp file on any failure
-        # before the atomic publish.
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".entry.txt.", suffix=".tmp", dir=out_dir
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
+def _publish(directory, data):
+    """Write ``data`` to entry.txt atomically via temp file plus rename.
+
+    mkstemp picks a unique name (O_EXCL internally), so a stale temp
+    file left by an interrupted earlier run can never block this run,
+    and the finally clause removes our temp file on any failure before
+    the atomic publish.
+    """
+    destination = os.path.join(directory, ENTRY_FILENAME)
+    scratch = None
+    try:
+        fd, scratch = tempfile.mkstemp(
+            prefix=".entry.txt.", suffix=".tmp", dir=directory
         )
         try:
-            _write_all(fd, payload)
+            _write_fully(fd, data)
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.chmod(tmp_path, 0o644)
-
-        # Atomic publish, then fsync the directory so the rename is durable.
-        os.replace(tmp_path, target)
-        tmp_path = None  # published; no longer ours to clean up
-        dir_fd = os.open(out_dir, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError as exc:
-        _fail("cannot publish %s: %s" % (target, exc))
+        os.chmod(scratch, ENTRY_MODE)
+        os.replace(scratch, destination)
+        scratch = None  # published; no longer ours to clean up
+        _fsync_dir(directory)
+    except OSError as err:
+        die("cannot publish %s: %s" % (destination, err))
     finally:
-        if tmp_path is not None:
+        if scratch is not None:
             try:
-                os.unlink(tmp_path)
+                os.unlink(scratch)
             except OSError:
                 pass
+    return destination
 
-    # Read-back verification: the file must match the constant byte for byte.
-    with open(target, "rb") as handle:
-        on_disk = handle.read()
-    if on_disk != payload:
-        _fail("read-back mismatch: entry.txt does not match the sentence")
-    mode = stat.S_IMODE(os.stat(target).st_mode)
-    if mode != 0o644:
-        _fail("entry.txt mode is %o, expected 0644" % mode)
 
-    print("wrote %s (%d characters, %d bytes)" % (target, len(SENTENCE), len(payload)))
+def _verify_written(path, expected):
+    """Read-back check: the file must match the constant byte for byte."""
+    with open(path, "rb") as handle:
+        actual = handle.read()
+    if actual != expected:
+        die("read-back mismatch: entry.txt does not match the sentence")
+    found = stat.S_IMODE(os.stat(path).st_mode)
+    if found != ENTRY_MODE:
+        die("entry.txt mode is %o, expected 0644" % found)
+
+
+def main():
+    check_entry(ENTRY_TEXT)
+    encoded = ENTRY_TEXT.encode("utf-8")
+    directory = _output_dir()
+    _clear_top_level(directory)
+    target = _publish(directory, encoded)
+    _verify_written(target, encoded)
+    print(
+        "wrote %s (%d characters, %d bytes)"
+        % (target, len(ENTRY_TEXT), len(encoded))
+    )
 
 
 if __name__ == "__main__":
